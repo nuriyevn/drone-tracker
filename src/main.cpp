@@ -1,8 +1,11 @@
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 
 #include "application/TrackingApplication.hpp"
+#include "interfaces/IVideoSource.hpp"
+#include "sources/CameraVideoSource.hpp"
 #include "sources/FileVideoSource.hpp"
 #include "tracking/CSRTTracker.hpp"
 
@@ -10,8 +13,12 @@ namespace {
 
 void printUsage(const char* programName)
 {
-    std::cout << "Usage: " << programName << " --source file --input <path-to-video>\n"
-              << "Example: " << programName << " --source file --input \"C:/Videos/drone.mp4\"\n";
+    std::cout << "Usage:\n"
+              << "  " << programName << " --source file --input <path-to-video>\n"
+              << "  " << programName << " --source camera\n"
+              << "Examples:\n"
+              << "  " << programName << " --source file --input \"C:/Videos/drone.mp4\"\n"
+              << "  " << programName << " --source camera\n";
 }
 
 bool parseCommandLine(int argc,
@@ -55,8 +62,19 @@ bool parseCommandLine(int argc,
         return false;
     }
 
-    if (inputPath.empty()) {
+    if (sourceType != "file" && sourceType != "camera") {
+        std::cerr << "Unsupported source type: " << sourceType
+                  << ". Supported types are: file, camera" << std::endl;
+        return false;
+    }
+
+    if (sourceType == "file" && inputPath.empty()) {
         std::cerr << "Missing required --input argument." << std::endl;
+        return false;
+    }
+
+    if (sourceType == "camera" && !inputPath.empty()) {
+        std::cerr << "--input can only be used with --source file." << std::endl;
         return false;
     }
 
@@ -81,19 +99,17 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    if (sourceType != "file") {
-        std::cerr << "Unsupported source type: " << sourceType
-                  << ". Supported type is: file" << std::endl;
-        printUsage(argv[0]);
-        return 1;
+    std::unique_ptr<drone_tracker::IVideoSource> videoSource;
+    if (sourceType == "file") {
+        if (!std::filesystem::exists(inputPath)) {
+            std::cerr << "Input file does not exist: " << inputPath << std::endl;
+            return 1;
+        }
+        videoSource = std::make_unique<drone_tracker::FileVideoSource>(inputPath);
+    } else {
+        videoSource = std::make_unique<drone_tracker::CameraVideoSource>();
     }
 
-    if (!std::filesystem::exists(inputPath)) {
-        std::cerr << "Input file does not exist: " << inputPath << std::endl;
-        return 1;
-    }
-
-    auto videoSource = std::make_unique<drone_tracker::FileVideoSource>(inputPath);
     auto tracker = std::make_unique<drone_tracker::CSRTTracker>();
     drone_tracker::TrackingApplication app(std::move(videoSource), std::move(tracker));
     return app.run();

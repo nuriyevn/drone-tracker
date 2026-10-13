@@ -1,5 +1,5 @@
 #pragma once
-#include <opencv2/videoio.hpp>s
+#include <opencv2/videoio.hpp>
 #include <string>
 
 #include "interfaces/IVideoSource.hpp"

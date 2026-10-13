@@ -104,7 +104,7 @@ int TrackingApplication::run()
     }
 
     if (!video_source_->open()) {
-        std::cerr << "Failed to open video source: " << "invalid or inaccessible input" << std::endl;
+        std::cerr << "Failed to open video source." << std::endl;
         return 1;
     }
 

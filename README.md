@@ -1,6 +1,6 @@
 # Drone Tracker
 
-A lightweight C++17 drone tracking sample built with OpenCV and CMake. The current implementation follows a clean separation between video acquisition, tracker logic, 2D coordinate calculation, and the application loop. It is designed so a future webcam or IP-camera source and a detector-based pipeline can be added without rewriting the tracking workflow.
+A lightweight C++17 drone tracking sample built with OpenCV and CMake. The current implementation follows a clean separation between video acquisition, tracker logic, 2D coordinate calculation, and the application loop.
 
 ## Project purpose and scope
 
@@ -18,6 +18,7 @@ The repository uses interface-based components and dependency injection:
 
 - IVideoSource: abstraction for video acquisition
 - FileVideoSource: reads a local video file using cv::VideoCapture
+- CameraVideoSource: enumerates Windows video-input devices and streams from the first one
 - IObjectTracker: abstraction for tracking algorithms
 - CSRTTracker: OpenCV CSRT implementation
 - ObjectPosition: stores the center point, ROI, and tracking status
@@ -66,9 +67,10 @@ Run the application:
 
 ```powershell
 ./build/drone-tracker.exe --source file --input "C:/Videos/drone.mp4"
+./build/drone-tracker.exe --source camera
 ```
 
-If the source is a local path, the app displays the video and waits for the user to select a drone ROI.
+The camera source uses the Windows DirectShow device enumerator to verify that a camera is available, then opens the first device through OpenCV's DirectShow backend. The app displays the stream and waits for the user to select a drone ROI.
 
 ## Controls and coordinate conventions
 
@@ -88,9 +90,9 @@ Example output:
 
 ## Current limitations
 
-- Only a local file-based video source is implemented initially.
+- The camera source is Windows-only and always selects the first enumerated camera.
 - A user must select the drone ROI manually before tracking begins.
-- The current application does not implement camera discovery, network stream handling, neural detection, or GPS-based localization.
+- The current application does not implement network stream handling, neural detection, or GPS-based localization.
 - Tracker recovery is manual via the R key.
 
 ## Adding a new video source

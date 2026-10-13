@@ -16,6 +16,7 @@ find_package(OpenCV CONFIG REQUIRED)
 
 add_library(drone_tracker_lib STATIC
     src/models/ObjectPosition.cpp
+    src/sources/CameraVideoSource.cpp
     src/sources/FileVideoSource.cpp
     src/tracking/CSRTTracker.cpp
     src/application/TrackingApplication.cpp
@@ -31,6 +32,10 @@ target_link_libraries(drone_tracker_lib
     PUBLIC
         ${OpenCV_LIBS}
 )
+
+if(WIN32)
+    target_link_libraries(drone_tracker_lib PRIVATE strmiids ole32)
+endif()
 
 add_executable(drone-tracker
     src/main.cpp
