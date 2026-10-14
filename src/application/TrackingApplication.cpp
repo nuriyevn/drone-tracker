@@ -113,17 +113,19 @@ bool hasPlausibleScale(const cv::Rect& reference,
 bool isGeometryPlausible(const cv::Rect& previous,
                          const cv::Rect& current,
                          const cv::Rect& initial,
-                         const TrackingGeometryLimits& limits)
+                         const TrackingGeometryLimits& limits,
+                         double& frameScaleRatio,
+                         double& frameCenterDisplacement,
+                         double& aspectRatioToInitial)
 {
-    if (!hasPlausibleScale(previous, current,
-                           limits.minFrameToFrameScaleRatio,
-                           limits.maxFrameToFrameScaleRatio) ||
-        !hasPlausibleScale(initial, current,
-                           limits.minInitialScaleRatio,
-                           limits.maxInitialScaleRatio)) {
+    if (previous.area() <= 0 || initial.area() <= 0 ||
+        previous.width <= 0 || previous.height <= 0 ||
+        initial.width <= 0 || initial.height <= 0 ||
+        current.width <= 0 || current.height <= 0) {
         return false;
     }
 
+    frameScaleRatio = areaScaleRatio(previous, current);
     const double previousCenterX = previous.x + previous.width / 2.0;
     const double previousCenterY = previous.y + previous.height / 2.0;
     const double currentCenterX = current.x + current.width / 2.0;
@@ -132,7 +134,54 @@ bool isGeometryPlausible(const cv::Rect& previous,
                                            currentCenterY - previousCenterY);
     const double boxSize = static_cast<double>(
         std::max({previous.width, previous.height, current.width, current.height}));
-    return displacement <= limits.maxCenterDisplacementInBoxSizes * boxSize;
+    frameCenterDisplacement = displacement / boxSize;
+
+    const double initialAspectRatio =
+        static_cast<double>(initial.width) / static_cast<double>(initial.height);
+    const double currentAspectRatio =
+        static_cast<double>(current.width) / static_cast<double>(current.height);
+    aspectRatioToInitial = currentAspectRatio / initialAspectRatio;
+
+    const bool frameToFramePlausible =
+        std::isfinite(frameScaleRatio) &&
+        frameScaleRatio >= limits.minFrameToFrameScaleRatio &&
+        frameScaleRatio <= limits.maxFrameToFrameScaleRatio &&
+        frameCenterDisplacement <= limits.maxCenterDisplacementInBoxSizes;
+    const bool initialSizePlausible =
+        hasPlausibleScale(initial, current,
+                          limits.minInitialScaleRatio,
+                          limits.maxInitialScaleRatio);
+    const bool aspectRatioPlausible =
+        std::isfinite(aspectRatioToInitial) &&
+        aspectRatioToInitial >= limits.minAspectRatioToInitial &&
+        aspectRatioToInitial <= limits.maxAspectRatioToInitial;
+    return frameToFramePlausible && initialSizePlausible && aspectRatioPlausible;
+}
+
+bool isCumulativeGeometryPlausible(const cv::Rect& reference,
+                                   const cv::Rect& current,
+                                   const TrackingGeometryLimits& limits,
+                                   double& scaleRatio,
+                                   double& centerDisplacement)
+{
+    if (reference.area() <= 0 || current.area() <= 0) {
+        return false;
+    }
+
+    scaleRatio = areaScaleRatio(reference, current);
+    const double referenceCenterX = reference.x + reference.width / 2.0;
+    const double referenceCenterY = reference.y + reference.height / 2.0;
+    const double currentCenterX = current.x + current.width / 2.0;
+    const double currentCenterY = current.y + current.height / 2.0;
+    const double displacement = std::hypot(currentCenterX - referenceCenterX,
+                                           currentCenterY - referenceCenterY);
+    const double boxSize = static_cast<double>(
+        std::max({reference.width, reference.height, current.width, current.height}));
+    centerDisplacement = displacement / boxSize;
+    return std::isfinite(scaleRatio) &&
+           scaleRatio >= limits.minCumulativeScaleRatio &&
+           scaleRatio <= limits.maxCumulativeScaleRatio &&
+           centerDisplacement <= limits.maxCumulativeCenterDisplacementInBoxSizes;
 }
 
 bool areValidGeometryLimits(const TrackingGeometryLimits& limits)
@@ -146,7 +195,29 @@ bool areValidGeometryLimits(const TrackingGeometryLimits& limits)
            std::isfinite(limits.minInitialScaleRatio) &&
            limits.minInitialScaleRatio > 0.0 &&
            std::isfinite(limits.maxInitialScaleRatio) &&
-           limits.maxInitialScaleRatio >= limits.minInitialScaleRatio;
+           limits.maxInitialScaleRatio >= limits.minInitialScaleRatio &&
+           std::isfinite(limits.minAspectRatioToInitial) &&
+           limits.minAspectRatioToInitial > 0.0 &&
+           std::isfinite(limits.maxAspectRatioToInitial) &&
+           limits.maxAspectRatioToInitial >= limits.minAspectRatioToInitial &&
+           limits.cumulativeWindowFrames >= 2 &&
+           std::isfinite(limits.minCumulativeScaleRatio) &&
+           limits.minCumulativeScaleRatio > 0.0 &&
+           std::isfinite(limits.maxCumulativeScaleRatio) &&
+           limits.maxCumulativeScaleRatio >= limits.minCumulativeScaleRatio &&
+           std::isfinite(limits.maxCumulativeCenterDisplacementInBoxSizes) &&
+           limits.maxCumulativeCenterDisplacementInBoxSizes > 0.0;
+}
+
+std::string formatRatio(double value)
+{
+    if (!std::isfinite(value) || value < 0.0) {
+        return "n/a";
+    }
+
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(2) << value << "x";
+    return stream.str();
 }
 
 std::filesystem::path makeRecordingPath(const std::filesystem::path& directory)
@@ -284,9 +355,37 @@ double TrackingApplication::templateSimilarity(const cv::Mat& frame, const cv::R
 }
 
 bool TrackingApplication::hasPlausibleGeometry(const cv::Rect& previousRoi,
-                                               const cv::Rect& roi) const
+                                               const cv::Rect& roi,
+                                               double& frameScaleRatio,
+                                               double& frameCenterDisplacement,
+                                               double& aspectRatioToInitial,
+                                               double& windowScaleRatio,
+                                               double& windowCenterDisplacement) const
 {
-    return isGeometryPlausible(previousRoi, roi, initial_roi_, geometry_limits_);
+    const bool frameGeometryPlausible =
+        isGeometryPlausible(previousRoi, roi, initial_roi_, geometry_limits_,
+                            frameScaleRatio, frameCenterDisplacement,
+                            aspectRatioToInitial);
+    windowScaleRatio = -1.0;
+    windowCenterDisplacement = -1.0;
+
+    if (accepted_roi_history_.size() < geometry_limits_.cumulativeWindowFrames) {
+        return frameGeometryPlausible;
+    }
+
+    const bool windowGeometryPlausible =
+        isCumulativeGeometryPlausible(accepted_roi_history_.front(), roi,
+                                      geometry_limits_, windowScaleRatio,
+                                      windowCenterDisplacement);
+    return frameGeometryPlausible && windowGeometryPlausible;
+}
+
+void TrackingApplication::rememberAcceptedRoi(const cv::Rect& roi)
+{
+    accepted_roi_history_.push_back(roi);
+    while (accepted_roi_history_.size() > geometry_limits_.cumulativeWindowFrames) {
+        accepted_roi_history_.pop_front();
+    }
 }
 
 void TrackingApplication::renderFrame(cv::Mat& frame,
@@ -294,7 +393,12 @@ void TrackingApplication::renderFrame(cv::Mat& frame,
                                      const ObjectPosition& position,
                                      TrackingStatus status,
                                      double similarity,
-                                     unsigned int reacquisitionMatches) const
+                                     unsigned int reacquisitionMatches,
+                                     double frameScaleRatio,
+                                     double frameCenterDisplacement,
+                                     double aspectRatioToInitial,
+                                     double windowScaleRatio,
+                                     double windowCenterDisplacement) const
 {
     const auto statusText = statusToString(status);
     const cv::Scalar green(0, 255, 0);
@@ -336,6 +440,17 @@ void TrackingApplication::renderFrame(cv::Mat& frame,
         cv::putText(frame, confirmationText, cv::Point(20, 120),
                     cv::FONT_HERSHEY_SIMPLEX, 0.7, blue, 2);
     }
+    const std::string frameGeometryText =
+        "Frame size: " + formatRatio(frameScaleRatio) +
+        "  center shift: " + formatRatio(frameCenterDisplacement) +
+        "  aspect/init: " + formatRatio(aspectRatioToInitial);
+    cv::putText(frame, frameGeometryText, cv::Point(20, 150),
+                cv::FONT_HERSHEY_SIMPLEX, 0.6, blue, 2);
+    const std::string windowGeometryText =
+        "Window size: " + formatRatio(windowScaleRatio) +
+        "  center shift: " + formatRatio(windowCenterDisplacement);
+    cv::putText(frame, windowGeometryText, cv::Point(20, 178),
+                cv::FONT_HERSHEY_SIMPLEX, 0.6, blue, 2);
     cv::putText(frame, "Esc or Q to quit, R to reselect", cv::Point(20, frame.rows - 20),
                 cv::FONT_HERSHEY_SIMPLEX, 0.7, blue, 2);
 }
@@ -369,6 +484,12 @@ int TrackingApplication::run()
             break;
         }
 
+        current_frame_scale_ratio_ = -1.0;
+        current_frame_center_displacement_ = -1.0;
+        current_aspect_ratio_to_initial_ = -1.0;
+        current_window_scale_ratio_ = -1.0;
+        current_window_center_displacement_ = -1.0;
+
         if (!tracker_->isInitialized()) {
             if (target_template_gray_.empty()) {
                 // First selection (or an explicit request to select a different target).
@@ -377,6 +498,13 @@ int TrackingApplication::run()
                     initial_roi_ = roi;
                     target_template_gray_ = toGray(frame(roi)).clone();
                     current_similarity_ = templateSimilarity(frame, roi);
+                    accepted_roi_history_.clear();
+                    rememberAcceptedRoi(roi);
+                    current_frame_scale_ratio_ = 1.0;
+                    current_frame_center_displacement_ = 0.0;
+                    current_aspect_ratio_to_initial_ = 1.0;
+                    current_window_scale_ratio_ = -1.0;
+                    current_window_center_displacement_ = -1.0;
                     if (!tracker_->initialize(frame, roi)) {
                         std::cerr << "Tracker initialization failed for the selected ROI." << std::endl;
                         tracker_->reset();
@@ -413,6 +541,8 @@ int TrackingApplication::run()
                     if (tracker_->initialize(frame, recoveredRoi)) {
                         last_roi_ = recoveredRoi;
                         current_status_ = TrackingStatus::TRACKING;
+                        accepted_roi_history_.clear();
+                        rememberAcceptedRoi(recoveredRoi);
                         reacquisition_matches_ = 0;
                         pending_reacquisition_roi_ = cv::Rect();
                         std::cout << "Target reacquired at x=" << recoveredRoi.x
@@ -431,7 +561,13 @@ int TrackingApplication::run()
             const bool validBox = updateSucceeded && ObjectPosition::isValidRect(roi, frame.size());
             const double similarity = validBox ? templateSimilarity(frame, roi) : -1.0;
             current_similarity_ = similarity;
-            const bool validGeometry = validBox && hasPlausibleGeometry(last_roi_, roi);
+            const bool validGeometry =
+                validBox && hasPlausibleGeometry(
+                                last_roi_, roi, current_frame_scale_ratio_,
+                                current_frame_center_displacement_,
+                                current_aspect_ratio_to_initial_,
+                                current_window_scale_ratio_,
+                                current_window_center_displacement_);
 
             // CSRT success and appearance correlation alone cannot detect every drift.
             // Validate geometry even when the appearance score is unavailable.
@@ -442,9 +578,11 @@ int TrackingApplication::run()
                 last_roi_ = cv::Rect();
                 reacquisition_matches_ = 0;
                 pending_reacquisition_roi_ = cv::Rect();
+                accepted_roi_history_.clear();
             } else {
                 last_roi_ = roi;
                 current_status_ = TrackingStatus::TRACKING;
+                rememberAcceptedRoi(roi);
             }
         }
 
@@ -456,7 +594,9 @@ int TrackingApplication::run()
         }
 
         renderFrame(frame, last_roi_, position, current_status_, current_similarity_,
-                    reacquisition_matches_);
+                    reacquisition_matches_, current_frame_scale_ratio_,
+                    current_frame_center_displacement_, current_aspect_ratio_to_initial_,
+                    current_window_scale_ratio_, current_window_center_displacement_);
         if (!recordingStarted) {
             recordingPath = makeRecordingPath(video_source_->outputDirectory());
             double fps = video_source_->framesPerSecond();
@@ -490,9 +630,15 @@ int TrackingApplication::run()
             // R means manually choose a new target, so discard the old appearance template.
             target_template_gray_.release();
             initial_roi_ = cv::Rect();
+            accepted_roi_history_.clear();
             current_status_ = TrackingStatus::NOT_INITIALIZED;
             last_roi_ = cv::Rect();
             current_similarity_ = -1.0;
+            current_frame_scale_ratio_ = -1.0;
+            current_frame_center_displacement_ = -1.0;
+            current_aspect_ratio_to_initial_ = -1.0;
+            current_window_scale_ratio_ = -1.0;
+            current_window_center_displacement_ = -1.0;
             reacquisition_matches_ = 0;
             pending_reacquisition_roi_ = cv::Rect();
             std::cout << "Tracker reset. Please select a new ROI." << std::endl;

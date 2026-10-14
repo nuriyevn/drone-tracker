@@ -81,7 +81,9 @@ Every rendered frame is also recorded to a timestamped MP4 file. Recordings from
 - Esc or Q: quit the application
 - R: reset the tracker and select a new ROI after loss
 
-The overlay displays the template similarity score. Scores below `0.40` are treated as tracking loss; scores below `0.60` do not qualify for reacquisition. Reacquisition requires three consecutive qualifying matches at nearby positions. Tracking also checks the box's center displacement and scale against the previous frame and initial selection; these bounds are configurable with `TrackingGeometryLimits` in `TrackingApplication`'s constructor. `unavailable` means the selected template does not contain enough texture for a reliable similarity score; geometric checks still apply instead of treating that undefined score as a pass.
+The overlay displays the template similarity score and geometry diagnostics: per-frame size ratio and center shift (normalized by box size), aspect ratio relative to the initial selection, and size/center change across the history window. Scores below `0.40` are treated as tracking loss; scores below `0.60` do not qualify for reacquisition. Reacquisition requires three consecutive qualifying matches at nearby positions.
+
+`TrackingGeometryLimits`, passed to the `TrackingApplication` constructor, configures per-frame and cumulative geometry bounds. Defaults require the aspect ratio to remain within `0.65–1.55` times the initial ratio, and compare each candidate against a 12-frame history window using size bounds of `0.75–1.33` and a maximum center shift of 1.5 box sizes. `unavailable` means the selected template does not contain enough texture for a reliable similarity score; geometric checks still apply instead of treating that undefined score as a pass.
 
 Displayed coordinates are in image pixels using the origin at the upper-left corner:
 
