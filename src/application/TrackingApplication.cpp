@@ -1,5 +1,9 @@
 #include "application/TrackingApplication.hpp"
 
+#include <chrono>
+#include <cmath>
+#include <ctime>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -31,6 +35,29 @@ std::string formatCoordinate(double value)
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(1) << value;
     return stream.str();
+}
+
+std::filesystem::path makeRecordingPath(const std::filesystem::path& directory)
+{
+    const auto now = std::chrono::system_clock::now();
+    const auto time = std::chrono::system_clock::to_time_t(now);
+    std::tm localTime{};
+#if defined(_WIN32)
+    localtime_s(&localTime, &time);
+#else
+    localtime_r(&time, &localTime);
+#endif
+
+    std::ostringstream timestamp;
+    timestamp << std::put_time(&localTime, "%Y-%m-%d_%H-%M-%S");
+
+    const auto basePath = directory / (timestamp.str() + ".mp4");
+    auto outputPath = basePath;
+    unsigned int suffix = 1;
+    while (std::filesystem::exists(outputPath)) {
+        outputPath = directory / (timestamp.str() + "_" + std::to_string(suffix++) + ".mp4");
+    }
+    return outputPath;
 }
 
 }  // namespace
@@ -110,6 +137,9 @@ int TrackingApplication::run()
 
     cv::namedWindow(window_name_, cv::WINDOW_NORMAL);
     cv::Mat frame;
+    cv::VideoWriter writer;
+    std::filesystem::path recordingPath;
+    bool recordingStarted = false;
 
     while (true) {
         if (!video_source_->read(frame) || frame.empty()) {
@@ -149,6 +179,28 @@ int TrackingApplication::run()
         }
 
         renderFrame(frame, last_roi_, position, current_status_);
+        if (!recordingStarted) {
+            recordingPath = makeRecordingPath(video_source_->outputDirectory());
+            double fps = video_source_->framesPerSecond();
+            if (!std::isfinite(fps) || fps <= 0.0) {
+                fps = 30.0;
+                std::cerr << "Video source did not report a valid frame rate; recording at 30 FPS."
+                          << std::endl;
+            }
+
+            const bool isColor = frame.channels() != 1;
+            if (!writer.open(recordingPath.string(),
+                             cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                             fps, frame.size(), isColor)) {
+                std::cerr << "Failed to create recording: " << recordingPath.string() << std::endl;
+                video_source_->close();
+                cv::destroyAllWindows();
+                return 1;
+            }
+            recordingStarted = true;
+            std::cout << "Recording rendered video to: " << recordingPath.string() << std::endl;
+        }
+        writer.write(frame);
         cv::imshow(window_name_, frame);
 
         const int key = cv::waitKey(1) & 0xFF;
@@ -163,6 +215,9 @@ int TrackingApplication::run()
         }
     }
 
+    if (recordingStarted) {
+        writer.release();
+    }
     video_source_->close();
     cv::destroyAllWindows();
     return 0;

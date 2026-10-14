@@ -13,6 +13,8 @@ public:
     bool isOpened() const override;
     void close() override;
 
+    double framesPerSecond() const override;
+
 private:
     cv::VideoCapture capture_;
 };

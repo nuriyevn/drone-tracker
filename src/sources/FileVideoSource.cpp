@@ -35,6 +35,16 @@ void FileVideoSource::close()
     capture_.release();
 }
 
+double FileVideoSource::framesPerSecond() const
+{
+    return capture_.get(cv::CAP_PROP_FPS);
+}
+
+std::filesystem::path FileVideoSource::outputDirectory() const
+{
+    return std::filesystem::path(path_).parent_path();
+}
+
 const std::string& FileVideoSource::path() const noexcept
 {
     return path_;

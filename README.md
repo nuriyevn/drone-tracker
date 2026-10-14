@@ -72,6 +72,8 @@ Run the application:
 
 The camera source uses the Windows DirectShow device enumerator to verify that a camera is available, then opens the first device through OpenCV's DirectShow backend. The app displays the stream and waits for the user to select a drone ROI.
 
+Every rendered frame is also recorded to a timestamped MP4 file. Recordings from a video file are saved beside that input file; camera recordings are saved in the current working directory. The output name uses the format `YYYY-MM-DD_HH-MM-SS.mp4`. The source frame rate is used when available, otherwise the recording uses 30 FPS. The input file or stream is not modified.
+
 ## Controls and coordinate conventions
 
 - Left mouse button: select the drone ROI

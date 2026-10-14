@@ -15,6 +15,8 @@ public:
     bool isOpened() const override;
     void close() override;
 
+    double framesPerSecond() const override;
+    std::filesystem::path outputDirectory() const override;
     const std::string& path() const noexcept;
 
 private:

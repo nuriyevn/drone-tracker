@@ -128,4 +128,9 @@ void CameraVideoSource::close()
     capture_.release();
 }
 
+double CameraVideoSource::framesPerSecond() const
+{
+    return capture_.get(cv::CAP_PROP_FPS);
+}
+
 }  // namespace drone_tracker
