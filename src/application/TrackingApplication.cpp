@@ -1,5 +1,6 @@
 #include "application/TrackingApplication.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <ctime>
@@ -29,10 +30,11 @@ but it may fail if the drone rotates significantly, becomes too small, or is obs
 
 // Compare the appearance of the tracked box with the original user-selected ROI.
 // If the CSRT box drifts to unrelated background, this score should usually drop.
-constexpr double kMinimumTrackingSimilarity = 0.30;
+constexpr double kMinimumTrackingSimilarity = 0.40;
 
 // A more conservative threshold is used for a full-frame reacquisition search.
 constexpr double kReacquireSimilarityThreshold = 0.60;
+constexpr unsigned int kRequiredReacquisitionMatches = 3;
 
 std::string statusToString(TrackingStatus status)
 {
@@ -66,6 +68,27 @@ std::string formatCoordinate(double value)
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(1) << value;
     return stream.str();
+}
+
+std::string formatSimilarity(double value)
+{
+    if (!std::isfinite(value) || value < 0.0) {
+        return "unavailable";
+    }
+
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(2) << value;
+    return stream.str();
+}
+
+bool isSpatiallyConsistent(const cv::Rect& previous, const cv::Rect& current)
+{
+    const auto previousCenter = (previous.tl() + previous.br()) * 0.5;
+    const auto currentCenter = (current.tl() + current.br()) * 0.5;
+    const int allowedX = std::max(12, std::max(previous.width, current.width) / 2);
+    const int allowedY = std::max(12, std::max(previous.height, current.height) / 2);
+    return std::abs(previousCenter.x - currentCenter.x) <= allowedX &&
+           std::abs(previousCenter.y - currentCenter.y) <= allowedY;
 }
 
 std::filesystem::path makeRecordingPath(const std::filesystem::path& directory)
@@ -115,8 +138,10 @@ bool TrackingApplication::selectInitialRegion(cv::Mat& frame, cv::Rect& roi) con
     return true;
 }
 
-bool TrackingApplication::findTemplateMatch(const cv::Mat& frame, cv::Rect& roi) const
+bool TrackingApplication::findTemplateMatch(const cv::Mat& frame, cv::Rect& roi,
+                                           double& similarity) const
 {
+    similarity = -1.0;
     if (frame.empty() || target_template_gray_.empty()) {
         return false;
     }
@@ -159,6 +184,7 @@ bool TrackingApplication::findTemplateMatch(const cv::Mat& frame, cv::Rect& roi)
         }
     }
 
+    similarity = bestScore;
     if (bestScore < kReacquireSimilarityThreshold ||
         !ObjectPosition::isValidRect(bestRoi, frame.size())) {
         return false;
@@ -183,9 +209,9 @@ double TrackingApplication::templateSimilarity(const cv::Mat& frame, const cv::R
     cv::meanStdDev(target_template_gray_, mean, stddev);
     if (stddev[0] < 4.0) {
         // There is not enough texture to score this ROI reliably. Don't declare
-        // drift based on an undefined normalized-correlation value. Full-frame
-        // reacquisition will still require a textured template to avoid false hits.
-        return 1.0;
+        // drift based on an undefined normalized-correlation value or report it as
+        // a perfect match. Full-frame reacquisition requires a textured template.
+        return -1.0;
     }
 
     cv::Mat scores;
@@ -197,7 +223,9 @@ double TrackingApplication::templateSimilarity(const cv::Mat& frame, const cv::R
 void TrackingApplication::renderFrame(cv::Mat& frame,
                                      const cv::Rect& roi,
                                      const ObjectPosition& position,
-                                     TrackingStatus status) const
+                                     TrackingStatus status,
+                                     double similarity,
+                                     unsigned int reacquisitionMatches) const
 {
     const auto statusText = statusToString(status);
     const cv::Scalar green(0, 255, 0);
@@ -227,6 +255,18 @@ void TrackingApplication::renderFrame(cv::Mat& frame,
 
     cv::putText(frame, statusText, cv::Point(20, 20), cv::FONT_HERSHEY_SIMPLEX, 0.8, blue, 2);
     cv::putText(frame, coordinateText, cv::Point(20, 60), cv::FONT_HERSHEY_SIMPLEX, 0.8, blue, 2);
+    const std::string similarityText =
+        "Similarity: " + formatSimilarity(similarity) +
+        (status == TrackingStatus::LOST ? " (search)" : " (tracking)");
+    cv::putText(frame, similarityText, cv::Point(20, 90),
+                cv::FONT_HERSHEY_SIMPLEX, 0.7, blue, 2);
+    if (status == TrackingStatus::LOST && reacquisitionMatches > 0) {
+        const std::string confirmationText =
+            "Reacquisition: " + std::to_string(reacquisitionMatches) + "/" +
+            std::to_string(kRequiredReacquisitionMatches);
+        cv::putText(frame, confirmationText, cv::Point(20, 120),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7, blue, 2);
+    }
     cv::putText(frame, "Esc or Q to quit, R to reselect", cv::Point(20, frame.rows - 20),
                 cv::FONT_HERSHEY_SIMPLEX, 0.7, blue, 2);
 }
@@ -261,6 +301,7 @@ int TrackingApplication::run()
                 cv::Rect roi;
                 if (selectInitialRegion(frame, roi)) {
                     target_template_gray_ = toGray(frame(roi)).clone();
+                    current_similarity_ = templateSimilarity(frame, roi);
                     if (!tracker_->initialize(frame, roi)) {
                         std::cerr << "Tracker initialization failed for the selected ROI." << std::endl;
                         tracker_->reset();
@@ -275,19 +316,37 @@ int TrackingApplication::run()
                 }
             } else {
                 // CSRT is no longer initialized. Search the frame using the original ROI
-                // appearance, then initialize CSRT again only when a sufficiently strong
-                // match is found.
+                // appearance. Require repeated matches at nearby positions before trusting
+                // a candidate, rather than accepting one high correlation score.
                 current_status_ = TrackingStatus::LOST;
                 cv::Rect recoveredRoi;
-                if (findTemplateMatch(frame, recoveredRoi)) {
+                const bool foundMatch = findTemplateMatch(frame, recoveredRoi, current_similarity_);
+                if (foundMatch) {
+                    if (reacquisition_matches_ == 0 ||
+                        !isSpatiallyConsistent(pending_reacquisition_roi_, recoveredRoi)) {
+                        reacquisition_matches_ = 1;
+                    } else {
+                        ++reacquisition_matches_;
+                    }
+                    pending_reacquisition_roi_ = recoveredRoi;
+                } else {
+                    reacquisition_matches_ = 0;
+                    pending_reacquisition_roi_ = cv::Rect();
+                }
+
+                if (reacquisition_matches_ >= kRequiredReacquisitionMatches) {
                     if (tracker_->initialize(frame, recoveredRoi)) {
                         last_roi_ = recoveredRoi;
                         current_status_ = TrackingStatus::TRACKING;
+                        reacquisition_matches_ = 0;
+                        pending_reacquisition_roi_ = cv::Rect();
                         std::cout << "Target reacquired at x=" << recoveredRoi.x
                                   << ", y=" << recoveredRoi.y << std::endl;
                     } else {
                         tracker_->reset();
                         last_roi_ = cv::Rect();
+                        reacquisition_matches_ = 0;
+                        pending_reacquisition_roi_ = cv::Rect();
                     }
                 }
             }
@@ -296,13 +355,17 @@ int TrackingApplication::run()
             const bool updateSucceeded = tracker_->update(frame, roi);
             const bool validBox = updateSucceeded && ObjectPosition::isValidRect(roi, frame.size());
             const double similarity = validBox ? templateSimilarity(frame, roi) : -1.0;
+            current_similarity_ = similarity;
 
             // Important: CSRT returning true is not proof that the box still contains the
             // selected target. Validate appearance too, so drifting boxes trigger recovery.
-            if (!validBox || similarity < kMinimumTrackingSimilarity) {
+            if (!validBox ||
+                (similarity >= 0.0 && similarity < kMinimumTrackingSimilarity)) {
                 tracker_->reset();
                 current_status_ = TrackingStatus::LOST;
                 last_roi_ = cv::Rect();
+                reacquisition_matches_ = 0;
+                pending_reacquisition_roi_ = cv::Rect();
             } else {
                 last_roi_ = roi;
                 current_status_ = TrackingStatus::TRACKING;
@@ -316,7 +379,8 @@ int TrackingApplication::run()
             position.status = current_status_;
         }
 
-        renderFrame(frame, last_roi_, position, current_status_);
+        renderFrame(frame, last_roi_, position, current_status_, current_similarity_,
+                    reacquisition_matches_);
         if (!recordingStarted) {
             recordingPath = makeRecordingPath(video_source_->outputDirectory());
             double fps = video_source_->framesPerSecond();
@@ -351,6 +415,9 @@ int TrackingApplication::run()
             target_template_gray_.release();
             current_status_ = TrackingStatus::NOT_INITIALIZED;
             last_roi_ = cv::Rect();
+            current_similarity_ = -1.0;
+            reacquisition_matches_ = 0;
+            pending_reacquisition_roi_ = cv::Rect();
             std::cout << "Tracker reset. Please select a new ROI." << std::endl;
         }
     }
