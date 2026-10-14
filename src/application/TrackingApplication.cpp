@@ -91,6 +91,64 @@ bool isSpatiallyConsistent(const cv::Rect& previous, const cv::Rect& current)
            std::abs(previousCenter.y - currentCenter.y) <= allowedY;
 }
 
+double areaScaleRatio(const cv::Rect& reference, const cv::Rect& candidate)
+{
+    return std::sqrt(static_cast<double>(candidate.area()) /
+                     static_cast<double>(reference.area()));
+}
+
+bool hasPlausibleScale(const cv::Rect& reference,
+                       const cv::Rect& candidate,
+                       double minimumRatio,
+                       double maximumRatio)
+{
+    if (reference.area() <= 0 || candidate.area() <= 0) {
+        return false;
+    }
+
+    const double ratio = areaScaleRatio(reference, candidate);
+    return std::isfinite(ratio) && ratio >= minimumRatio && ratio <= maximumRatio;
+}
+
+bool isGeometryPlausible(const cv::Rect& previous,
+                         const cv::Rect& current,
+                         const cv::Rect& initial,
+                         const TrackingGeometryLimits& limits)
+{
+    if (!hasPlausibleScale(previous, current,
+                           limits.minFrameToFrameScaleRatio,
+                           limits.maxFrameToFrameScaleRatio) ||
+        !hasPlausibleScale(initial, current,
+                           limits.minInitialScaleRatio,
+                           limits.maxInitialScaleRatio)) {
+        return false;
+    }
+
+    const double previousCenterX = previous.x + previous.width / 2.0;
+    const double previousCenterY = previous.y + previous.height / 2.0;
+    const double currentCenterX = current.x + current.width / 2.0;
+    const double currentCenterY = current.y + current.height / 2.0;
+    const double displacement = std::hypot(currentCenterX - previousCenterX,
+                                           currentCenterY - previousCenterY);
+    const double boxSize = static_cast<double>(
+        std::max({previous.width, previous.height, current.width, current.height}));
+    return displacement <= limits.maxCenterDisplacementInBoxSizes * boxSize;
+}
+
+bool areValidGeometryLimits(const TrackingGeometryLimits& limits)
+{
+    return std::isfinite(limits.maxCenterDisplacementInBoxSizes) &&
+           limits.maxCenterDisplacementInBoxSizes > 0.0 &&
+           std::isfinite(limits.minFrameToFrameScaleRatio) &&
+           limits.minFrameToFrameScaleRatio > 0.0 &&
+           std::isfinite(limits.maxFrameToFrameScaleRatio) &&
+           limits.maxFrameToFrameScaleRatio >= limits.minFrameToFrameScaleRatio &&
+           std::isfinite(limits.minInitialScaleRatio) &&
+           limits.minInitialScaleRatio > 0.0 &&
+           std::isfinite(limits.maxInitialScaleRatio) &&
+           limits.maxInitialScaleRatio >= limits.minInitialScaleRatio;
+}
+
 std::filesystem::path makeRecordingPath(const std::filesystem::path& directory)
 {
     const auto now = std::chrono::system_clock::now();
@@ -118,10 +176,12 @@ std::filesystem::path makeRecordingPath(const std::filesystem::path& directory)
 
 TrackingApplication::TrackingApplication(std::unique_ptr<IVideoSource> videoSource,
                                          std::unique_ptr<IObjectTracker> tracker,
-                                         std::string windowName)
+                                         std::string windowName,
+                                         TrackingGeometryLimits geometryLimits)
     : video_source_(std::move(videoSource)),
       tracker_(std::move(tracker)),
-      window_name_(std::move(windowName)) {}
+      window_name_(std::move(windowName)),
+      geometry_limits_(geometryLimits) {}
 
 bool TrackingApplication::selectInitialRegion(cv::Mat& frame, cv::Rect& roi) const
 {
@@ -186,6 +246,9 @@ bool TrackingApplication::findTemplateMatch(const cv::Mat& frame, cv::Rect& roi,
 
     similarity = bestScore;
     if (bestScore < kReacquireSimilarityThreshold ||
+        !hasPlausibleScale(initial_roi_, bestRoi,
+                           geometry_limits_.minInitialScaleRatio,
+                           geometry_limits_.maxInitialScaleRatio) ||
         !ObjectPosition::isValidRect(bestRoi, frame.size())) {
         return false;
     }
@@ -218,6 +281,12 @@ double TrackingApplication::templateSimilarity(const cv::Mat& frame, const cv::R
     cv::matchTemplate(candidate, target_template_gray_, scores, cv::TM_CCOEFF_NORMED);
     const double score = static_cast<double>(scores.at<float>(0, 0));
     return std::isfinite(score) ? score : -1.0;
+}
+
+bool TrackingApplication::hasPlausibleGeometry(const cv::Rect& previousRoi,
+                                               const cv::Rect& roi) const
+{
+    return isGeometryPlausible(previousRoi, roi, initial_roi_, geometry_limits_);
 }
 
 void TrackingApplication::renderFrame(cv::Mat& frame,
@@ -278,6 +347,11 @@ int TrackingApplication::run()
         return 1;
     }
 
+    if (!areValidGeometryLimits(geometry_limits_)) {
+        std::cerr << "Tracking geometry limits are invalid." << std::endl;
+        return 1;
+    }
+
     if (!video_source_->open()) {
         std::cerr << "Failed to open video source." << std::endl;
         return 1;
@@ -300,6 +374,7 @@ int TrackingApplication::run()
                 // First selection (or an explicit request to select a different target).
                 cv::Rect roi;
                 if (selectInitialRegion(frame, roi)) {
+                    initial_roi_ = roi;
                     target_template_gray_ = toGray(frame(roi)).clone();
                     current_similarity_ = templateSimilarity(frame, roi);
                     if (!tracker_->initialize(frame, roi)) {
@@ -356,10 +431,11 @@ int TrackingApplication::run()
             const bool validBox = updateSucceeded && ObjectPosition::isValidRect(roi, frame.size());
             const double similarity = validBox ? templateSimilarity(frame, roi) : -1.0;
             current_similarity_ = similarity;
+            const bool validGeometry = validBox && hasPlausibleGeometry(last_roi_, roi);
 
-            // Important: CSRT returning true is not proof that the box still contains the
-            // selected target. Validate appearance too, so drifting boxes trigger recovery.
-            if (!validBox ||
+            // CSRT success and appearance correlation alone cannot detect every drift.
+            // Validate geometry even when the appearance score is unavailable.
+            if (!validGeometry ||
                 (similarity >= 0.0 && similarity < kMinimumTrackingSimilarity)) {
                 tracker_->reset();
                 current_status_ = TrackingStatus::LOST;
@@ -413,6 +489,7 @@ int TrackingApplication::run()
             tracker_->reset();
             // R means manually choose a new target, so discard the old appearance template.
             target_template_gray_.release();
+            initial_roi_ = cv::Rect();
             current_status_ = TrackingStatus::NOT_INITIALIZED;
             last_roi_ = cv::Rect();
             current_similarity_ = -1.0;
