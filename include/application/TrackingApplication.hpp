@@ -3,6 +3,8 @@
 #include <memory>
 #include <string>
 
+#include <opencv2/core.hpp>
+
 #include "interfaces/IObjectTracker.hpp"
 #include "interfaces/IVideoSource.hpp"
 #include "models/ObjectPosition.hpp"
@@ -19,6 +21,8 @@ public:
 
 private:
     bool selectInitialRegion(cv::Mat& frame, cv::Rect& roi) const;
+    bool findTemplateMatch(const cv::Mat& frame, cv::Rect& roi) const;
+    double templateSimilarity(const cv::Mat& frame, const cv::Rect& roi) const;
     void renderFrame(cv::Mat& frame, const cv::Rect& roi, const ObjectPosition& position,
                      TrackingStatus status) const;
 
@@ -26,6 +30,7 @@ private:
     std::unique_ptr<IObjectTracker> tracker_;
     std::string window_name_;
     cv::Rect last_roi_;
+    cv::Mat target_template_gray_;
     TrackingStatus current_status_ = TrackingStatus::NOT_INITIALIZED;
 };
 
